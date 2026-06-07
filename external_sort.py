@@ -2,81 +2,83 @@ import sys
 import os
 import struct
 import tempfile
-import heapq
 import multiprocessing
-from array import array
-# 工作进程：负责对数据块进行快速排序 (利用多核)
-def sort_chunk(args):
-    temp_file_path, chunk_size = args
-    arr = array('i')  # 'i' 代表 32位有符号整数
+import heapq
 
-    with open(temp_file_path, 'rb') as f:
-        try:
-            arr.fromfile(f, chunk_size)
-        except EOFError:
-            pass
+# 对一个临时块文件进行排序（读入内存排序写回）
+def sort_chunk(chunk_path):
+    with open(chunk_path, 'rb') as f:
+        raw = f.read()
+    # 每4字节解析为一个整数
+    numbers = []
+    for i in range(0, len(raw), 4):
+        numbers.append(struct.unpack('<i', raw[i:i+4])[0])
+    numbers.sort()
+    with open(chunk_path, 'wb') as f:
+        for x in numbers:
+            f.write(struct.pack('<i', x))
 
-            # 在内存中进行排序 (O(n log n) 复杂度)
-    arr = sorted(arr)
-    sorted_arr = array('i', arr)
+# 多路归并：将多个已排序的临时文件合并成一个输出文件
+def merge_files(sorted_paths, out_path):
+    # 打开所有临时文件
+    files = [open(p, 'rb') for p in sorted_paths]
+    heap = []
+    # 读每个文件的第一个整数
+    for idx, f in enumerate(files):
+        buf = f.read(4)
+        if buf:
+            val = struct.unpack('<i', buf)[0]
+            heap.append((val, idx))
+    heapq.heapify(heap)
 
-    # 覆写回临时文件
-    with open(temp_file_path, 'wb') as f:
-        sorted_arr.tofile(f)
+    with open(out_path, 'wb') as out:
+        while heap:
+            val, idx = heapq.heappop(heap)
+            out.write(struct.pack('<i', val))
+            # 从同一个文件读取下一个整数
+            buf = files[idx].read(4)
+            if buf:
+                next_val = struct.unpack('<i', buf)[0]
+                heapq.heappush(heap, (next_val, idx))
 
-    return temp_file_path
-# 生成器：逐个读取二进制整数，极低内存占用
-def read_ints_from_file(file_path):
-    with open(file_path, 'rb') as f:
-        while True:
-            bytes_read = f.read(4)  # 32位 = 4 bytes
-            if not bytes_read or len(bytes_read) < 4:
-                break
-            yield struct.unpack('<i', bytes_read)[0]
-# 主程序：拆分 -> 多进程排序 -> 多路归并
+    for f in files:
+        f.close()
+
 def external_sort(input_file, chunk_size):
-    output_file = input_file + ".sorted.bin"
-    bytes_per_chunk = chunk_size * 4
-    temp_dir = tempfile.mkdtemp()
+    out_file = input_file + ".sorted"
+    # 创建临时目录存放块文件
+    tmp_dir = tempfile.mkdtemp()
+    chunk_list = []
 
-    print(f"1. 正在拆分文件并分配给 {multiprocessing.cpu_count()} 个 CPU 核心进行排序...")
-    chunk_args = []
-    with open(input_file, 'rb') as f:
-        chunk_idx = 0
+    # 一将原文件拆分成若干块（每块最多 chunk_size 个整数）
+    with open(input_file, 'rb') as fin:
+        idx = 0
         while True:
-            chunk_data = f.read(bytes_per_chunk)
-            if not chunk_data:
+            block = fin.read(chunk_size * 4)
+            if not block:
                 break
-            temp_path = os.path.join(temp_dir, f"chunk_{chunk_idx}.bin")
-            with open(temp_path, 'wb') as tf:
-                tf.write(chunk_data)
-            chunk_args.append((temp_path, chunk_size))
-            chunk_idx += 1
+            tmp_path = os.path.join(tmp_dir, f"chunk_{idx}.tmp")
+            with open(tmp_path, 'wb') as fout:
+                fout.write(block)
+            chunk_list.append(tmp_path)
+            idx += 1
 
-    # 使用多进程池进行并行排序
-    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
-        sorted_temp_files = pool.map(sort_chunk, chunk_args)
+    # 二利用多核并行排序各个块
+    cpu_num = multiprocessing.cpu_count()
+    with multiprocessing.Pool(processes=cpu_num) as pool:
+        pool.map(sort_chunk, chunk_list)
 
-    print("2. 正在使用最小堆(Min-Heap)合并已排序的临时文件...")
-    generators = [read_ints_from_file(tf) for tf in sorted_temp_files]
-
-    # 写入最终结果
-    with open(output_file, 'wb') as out_f:
-        for val in heapq.merge(*generators):
-            out_f.write(struct.pack('<i', val))
+    # 三归并所有已排序的块
+    merge_files(chunk_list, out_file)
 
     # 清理临时文件
-    for tf in sorted_temp_files:
-        os.remove(tf)
-    os.rmdir(temp_dir)
-    print(f"排序完成！已生成排序后的文件: {output_file}")
-
+    for p in chunk_list:
+        os.remove(p)
+    os.rmdir(tmp_dir)
+    print("排序完成，结果保存在:", out_file)
 
 if __name__ == '__main__':
     if len(sys.argv) != 3:
-        print("用法: python external_sort.py <文件名> <允许加载的整数数量>")
+        print("用法: python sort.py <文件名> <每批整数数量>")
         sys.exit(1)
-
-    input_file = sys.argv[1]
-    chunk_size = int(sys.argv[2])
-    external_sort(input_file, chunk_size)
+    external_sort(sys.argv[1], int(sys.argv[2]))
